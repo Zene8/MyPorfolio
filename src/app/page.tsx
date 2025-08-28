@@ -1,25 +1,17 @@
-import ProjectCard from '@/components/ProjectCard';
+import Link from 'next/link';
 
-async function getProjects() {
-  // This will be replaced with a fetch to the Go API
-  // For now, we use the dummy data from the Go backend
-  const res = await fetch('http://localhost:3000/api/projects', { cache: 'no-store' });
-  if (!res.ok) {
-    throw new Error('Failed to fetch projects');
-  }
-  return res.json();
-}
-
-export default async function Home() {
-  const projects = await getProjects();
-
+export default function Home() {
   return (
-    <main className="container mx-auto px-4 py-8">
-      <h1 className="text-4xl font-bold mb-8">My Portfolio</h1>
-      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-8">
-        {projects.map((project: any) => (
-          <ProjectCard key={project.id} project={project} />
-        ))}
+    <main className="container mx-auto px-4 py-8 text-center">
+      <h1 className="text-4xl font-bold mb-8">Welcome to the Multi-User Portfolio Platform</h1>
+      <p className="mb-4">Showcase your projects and discover others'.</p>
+      <div className="space-x-4">
+        <Link href="/auth/signup" className="bg-blue-500 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded">
+          Sign Up
+        </Link>
+        <Link href="/auth/login" className="bg-gray-500 hover:bg-gray-700 text-white font-bold py-2 px-4 rounded">
+          Login
+        </Link>
       </div>
     </main>
   );
