@@ -23,7 +23,8 @@ func AuthMiddleware(next http.Handler) http.Handler {
 		}
 
 		// Pass user information to the next handler
-		ctx := context.WithValue(r.Context(), "username", claims.Username)
+		ctx := context.WithValue(r.Context(), "userID", claims.UserID)
+		ctx = context.WithValue(ctx, "username", claims.Username) // Keep username for convenience if needed
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }

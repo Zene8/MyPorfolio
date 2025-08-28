@@ -3,18 +3,22 @@ package main
 import (
 	"encoding/json"
 	"net/http"
+	"strconv"
+	"io"
+	"os"
+	"path/filepath"
 
 	"github.com/gorilla/mux"
+	"github.com/google/uuid"
 )
 
-// Helper function to get user from context
-func getUserFromContext(r *http.Request) (*User, error) {
-	username := r.Context().Value("username").(string)
-	var user User
-	if result := DB.Where("username = ?", username).First(&user); result.Error != nil {
-		return nil, result.Error
+// getUserIDFromContext retrieves the UserID from the request context.
+func getUserIDFromContext(r *http.Request) (uint, error) {
+	userID, ok := r.Context().Value("userID").(uint)
+	if !ok {
+		return 0, http.ErrMissingHeader // Or a custom error
 	}
-	return &user, nil
+	return userID, nil
 }
 
 // RegisterUser handles user registration.
@@ -22,49 +26,65 @@ func RegisterUser(w http.ResponseWriter, r *http.Request) {
 	var user User
 	err := json.NewDecoder(r.Body).Decode(&user)
 	if err != nil {
-		w.WriteHeader(http.StatusBadRequest)
+		http.Error(w, "Invalid request payload", http.StatusBadRequest)
 		return
 	}
 
 	hashedPassword, err := HashPassword(user.Password)
 	if err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
+		http.Error(w, "Failed to hash password", http.StatusInternalServerError)
 		return
 	}
 	user.Password = hashedPassword
 
 	if result := DB.Create(&user); result.Error != nil {
-		w.WriteHeader(http.StatusInternalServerError)
-		json.NewEncoder(w).Encode(map[string]string{"error": result.Error.Error()})
+		http.Error(w, result.Error.Error(), http.StatusInternalServerError)
 		return
 	}
 
+	// Create an empty portfolio for the new user
+	portfolio := Portfolio{
+		UserID:      user.ID,
+		Title:       user.Username + "'s Portfolio",
+		Description: "A place to showcase my work.",
+	}
+	if result := DB.Create(&portfolio); result.Error != nil {
+		// Log the error but don't fail registration, as portfolio can be created later
+		// In a real app, you might want to handle this more robustly (e.g., retry, queue)
+		// For now, we'll just log it.
+		// log.Printf("Failed to create portfolio for user %d: %v", user.ID, result.Error)
+	}
+
 	w.WriteHeader(http.StatusCreated)
+	json.NewEncoder(w).Encode(map[string]string{"message": "User registered successfully"})
 }
 
 // LoginUser handles user login.
 func LoginUser(w http.ResponseWriter, r *http.Request) {
-	var creds User
+	var creds struct {
+		Username string `json:"username"`
+		Password string `json:"password"`
+	}
 	err := json.NewDecoder(r.Body).Decode(&creds)
 	if err != nil {
-		w.WriteHeader(http.StatusBadRequest)
+		http.Error(w, "Invalid request payload", http.StatusBadRequest)
 		return
 	}
 
 	var user User
 	if result := DB.Where("username = ?", creds.Username).First(&user); result.Error != nil {
-		w.WriteHeader(http.StatusUnauthorized)
+		http.Error(w, "Invalid credentials", http.StatusUnauthorized)
 		return
 	}
 
 	if !CheckPasswordHash(creds.Password, user.Password) {
-		w.WriteHeader(http.StatusUnauthorized)
+		http.Error(w, "Invalid credentials", http.StatusUnauthorized)
 		return
 	}
 
-	token, err := GenerateJWT(user.Username)
+	token, err := GenerateJWT(user.ID, user.Username)
 	if err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
+		http.Error(w, "Failed to generate token", http.StatusInternalServerError)
 		return
 	}
 
@@ -73,41 +93,85 @@ func LoginUser(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// GetProjects handles getting all projects for a user.
-func GetProjects(w http.ResponseWriter, r *http.Request) {
-	user, err := getUserFromContext(r)
-	if err != nil {
-		w.WriteHeader(http.StatusUnauthorized)
+// GetPortfolio handles getting a user's public portfolio by username.
+func GetPortfolio(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	username := vars["username"]
+
+	var user User
+	if result := DB.Where("username = ?", username).First(&user); result.Error != nil {
+		http.Error(w, "User not found", http.StatusNotFound)
 		return
 	}
 
-	var projects []Project
-	if result := DB.Where("user_id = ?", user.ID).Find(&projects); result.Error != nil {
-		w.WriteHeader(http.StatusInternalServerError)
+	var portfolio Portfolio
+	if result := DB.Preload("Projects").Preload("Achievements").Where("user_id = ?", user.ID).First(&portfolio); result.Error != nil {
+		http.Error(w, "Portfolio not found", http.StatusNotFound)
 		return
 	}
 
-	json.NewEncoder(w).Encode(projects)
+	json.NewEncoder(w).Encode(portfolio)
 }
 
-// CreateProject handles creating a new project.
-func CreateProject(w http.ResponseWriter, r *http.Request) {
-	user, err := getUserFromContext(r)
+// UpdatePortfolio handles updating the authenticated user's portfolio.
+func UpdatePortfolio(w http.ResponseWriter, r *http.Request) {
+	userID, err := getUserIDFromContext(r)
 	if err != nil {
-		w.WriteHeader(http.StatusUnauthorized)
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	var updatedPortfolio Portfolio
+	err = json.NewDecoder(r.Body).Decode(&updatedPortfolio)
+	if err != nil {
+		http.Error(w, "Invalid request payload", http.StatusBadRequest)
+		return
+	}
+
+	var portfolio Portfolio
+	if result := DB.Where("user_id = ?", userID).First(&portfolio); result.Error != nil {
+		http.Error(w, "Portfolio not found", http.StatusNotFound)
+		return
+	}
+
+	// Update fields that are allowed to be updated
+	portfolio.Title = updatedPortfolio.Title
+	portfolio.Description = updatedPortfolio.Description
+	portfolio.AboutMe = updatedPortfolio.AboutMe
+	portfolio.ContactInfo = updatedPortfolio.ContactInfo
+
+	if result := DB.Save(&portfolio); result.Error != nil {
+		http.Error(w, "Failed to update portfolio", http.StatusInternalServerError)
+		return
+	}
+
+	json.NewEncoder(w).Encode(portfolio)
+}
+
+// CreateProject handles creating a new project for the authenticated user's portfolio.
+func CreateProject(w http.ResponseWriter, r *http.Request) {
+	userID, err := getUserIDFromContext(r)
+	if err != nil {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	var portfolio Portfolio
+	if result := DB.Where("user_id = ?", userID).First(&portfolio); result.Error != nil {
+		http.Error(w, "Portfolio not found for user", http.StatusNotFound)
 		return
 	}
 
 	var project Project
 	err = json.NewDecoder(r.Body).Decode(&project)
 	if err != nil {
-		w.WriteHeader(http.StatusBadRequest)
+		http.Error(w, "Invalid request payload", http.StatusBadRequest)
 		return
 	}
 
-	project.UserID = user.ID
+	project.PortfolioID = portfolio.ID
 	if result := DB.Create(&project); result.Error != nil {
-		w.WriteHeader(http.StatusInternalServerError)
+		http.Error(w, "Failed to create project", http.StatusInternalServerError)
 		return
 	}
 
@@ -115,74 +179,348 @@ func CreateProject(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(project)
 }
 
-// UpdateProject handles updating a project.
-func UpdateProject(w http.ResponseWriter, r *http.Request) {
-	user, err := getUserFromContext(r)
+// GetProjects handles getting all projects for the authenticated user's portfolio.
+func GetProjects(w http.ResponseWriter, r *http.Request) {
+	userID, err := getUserIDFromContext(r)
 	if err != nil {
-		w.WriteHeader(http.StatusUnauthorized)
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	var portfolio Portfolio
+	if result := DB.Where("user_id = ?", userID).First(&portfolio); result.Error != nil {
+		http.Error(w, "Portfolio not found for user", http.StatusNotFound)
+		return
+	}
+
+	var projects []Project
+	if result := DB.Where("portfolio_id = ?", portfolio.ID).Find(&projects); result.Error != nil {
+		http.Error(w, "Failed to retrieve projects", http.StatusInternalServerError)
+		return
+	}
+
+	json.NewEncoder(w).Encode(projects)
+}
+
+// UpdateProject handles updating a project belonging to the authenticated user's portfolio.
+func UpdateProject(w http.ResponseWriter, r *http.Request) {
+	userID, err := getUserIDFromContext(r)
+	if err != nil {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return
 	}
 
 	vars := mux.Vars(r)
-	projectID := vars["id"]
+	projectIDStr := vars["id"]
+	projectID, err := strconv.ParseUint(projectIDStr, 10, 64)
+	if err != nil {
+		http.Error(w, "Invalid project ID", http.StatusBadRequest)
+		return	}
 
-	var project Project
-	if result := DB.Where("id = ? AND user_id = ?", projectID, user.ID).First(&project); result.Error != nil {
-		w.WriteHeader(http.StatusNotFound)
+	var portfolio Portfolio
+	if result := DB.Where("user_id = ?", userID).First(&portfolio); result.Error != nil {
+		http.Error(w, "Portfolio not found for user", http.StatusNotFound)
 		return
 	}
+
+	var project Project
+	if result := DB.Where("id = ? AND portfolio_id = ?", projectID, portfolio.ID).First(&project); result.Error != nil {
+		http.Error(w, "Project not found or not authorized", http.StatusNotFound)
+		return
+		}
 
 	var updatedProject Project
 	err = json.NewDecoder(r.Body).Decode(&updatedProject)
 	if err != nil {
-		w.WriteHeader(http.StatusBadRequest)
+		http.Error(w, "Invalid request payload", http.StatusBadRequest)
 		return
 	}
 
 	project.Title = updatedProject.Title
 	project.Description = updatedProject.Description
-	DB.Save(&project)
+	project.Technologies = updatedProject.Technologies
+	project.Link = updatedProject.Link
+	project.ImageURL = updatedProject.ImageURL
+
+	if result := DB.Save(&project); result.Error != nil {
+		http.Error(w, "Failed to update project", http.StatusInternalServerError)
+		return
+	}
 
 	json.NewEncoder(w).Encode(project)
 }
 
-// DeleteProject handles deleting a project.
+// DeleteProject handles deleting a project belonging to the authenticated user's portfolio.
 func DeleteProject(w http.ResponseWriter, r *http.Request) {
-	user, err := getUserFromContext(r)
+	userID, err := getUserIDFromContext(r)
 	if err != nil {
-		w.WriteHeader(http.StatusUnauthorized)
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return
 	}
 
 	vars := mux.Vars(r)
-	projectID := vars["id"]
-
-	var project Project
-	if result := DB.Where("id = ? AND user_id = ?", projectID, user.ID).First(&project); result.Error != nil {
-		w.WriteHeader(http.StatusNotFound)
+	projectIDStr := vars["id"]
+	projectID, err := strconv.ParseUint(projectIDStr, 10, 64)
+	if err != nil {
+		http.Error(w, "Invalid project ID", http.StatusBadRequest)
 		return
 	}
 
-	DB.Delete(&project)
+	var portfolio Portfolio
+	if result := DB.Where("user_id = ?", userID).First(&portfolio); result.Error != nil {
+		http.Error(w, "Portfolio not found for user", http.StatusNotFound)
+		return
+	}
+
+	if result := DB.Where("id = ? AND portfolio_id = ?", projectID, portfolio.ID).Delete(&Project{}); result.Error != nil {
+		http.Error(w, "Failed to delete project or not authorized", http.StatusInternalServerError)
+		return
+	}
+
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// GetUserProjects handles getting all projects for a specific user (public).
-func GetUserProjects(w http.ResponseWriter, r *http.Request) {
+// CreateAchievement handles creating a new achievement for the authenticated user's portfolio.
+func CreateAchievement(w http.ResponseWriter, r *http.Request) {
+	userID, err := getUserIDFromContext(r)
+	if err != nil {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	var portfolio Portfolio
+	if result := DB.Where("user_id = ?", userID).First(&portfolio); result.Error != nil {
+		http.Error(w, "Portfolio not found for user", http.StatusNotFound)
+		return
+	}
+
+	var achievement Achievement
+	err = json.NewDecoder(r.Body).Decode(&achievement)
+	if err != nil {
+		http.Error(w, "Invalid request payload", http.StatusBadRequest)
+		return
+	}
+
+	achievement.PortfolioID = portfolio.ID
+	if result := DB.Create(&achievement); result.Error != nil {
+		http.Error(w, "Failed to create achievement", http.StatusInternalServerError)
+		return
+	}
+
+	w.WriteHeader(http.StatusCreated)
+	json.NewEncoder(w).Encode(achievement)
+}
+
+// GetAchievements handles getting all achievements for the authenticated user's portfolio.
+func GetAchievements(w http.ResponseWriter, r *http.Request) {
+	userID, err := getUserIDFromContext(r)
+	if err != nil {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	var portfolio Portfolio
+	if result := DB.Where("user_id = ?", userID).First(&portfolio); result.Error != nil {
+		http.Error(w, "Portfolio not found for user", http.StatusNotFound)
+		return
+	}
+
+	var achievements []Achievement
+	if result := DB.Where("portfolio_id = ?", portfolio.ID).Find(&achievements); result.Error != nil {
+		http.Error(w, "Failed to retrieve achievements", http.StatusInternalServerError)
+		return
+	}
+
+	json.NewEncoder(w).Encode(achievements)
+}
+
+// UpdateAchievement handles updating an achievement belonging to the authenticated user's portfolio.
+func UpdateAchievement(w http.ResponseWriter, r *http.Request) {
+	userID, err := getUserIDFromContext(r)
+	if err != nil {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
 	vars := mux.Vars(r)
-	username := vars["username"]
+	achievementIDStr := vars["id"]
+	achievementID, err := strconv.ParseUint(achievementIDStr, 10, 64)
+	if err != nil {
+		http.Error(w, "Invalid achievement ID", http.StatusBadRequest)
+		return
+	}
+
+	var portfolio Portfolio
+	if result := DB.Where("user_id = ?", userID).First(&portfolio); result.Error != nil {
+		http.Error(w, "Portfolio not found for user", http.StatusNotFound)
+		return
+	}
+
+	var achievement Achievement
+	if result := DB.Where("id = ? AND portfolio_id = ?", achievementID, portfolio.ID).First(&achievement); result.Error != nil {
+		http.Error(w, "Achievement not found or not authorized", http.StatusNotFound)
+		return
+	}
+
+	var updatedAchievement Achievement
+	err = json.NewDecoder(r.Body).Decode(&updatedAchievement)
+	if err != nil {
+		http.Error(w, "Invalid request payload", http.StatusBadRequest)
+		return
+	}
+
+	achievement.Title = updatedAchievement.Title
+	achievement.Description = updatedAchievement.Description
+	achievement.Date = updatedAchievement.Date
+
+	if result := DB.Save(&achievement); result.Error != nil {
+		http.Error(w, "Failed to update achievement", http.StatusInternalServerError)
+		return
+	}
+
+	json.NewEncoder(w).Encode(achievement)
+}
+
+// DeleteAchievement handles deleting an achievement belonging to the authenticated user's portfolio.
+func DeleteAchievement(w http.ResponseWriter, r *http.Request) {
+	userID, err := getUserIDFromContext(r)
+	if err != nil {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	vars := mux.Vars(r)
+	achievementIDStr := vars["id"]
+	achievementID, err := strconv.ParseUint(achievementIDStr, 10, 64)
+	if err != nil {
+		http.Error(w, "Invalid achievement ID", http.StatusBadRequest)
+		return
+	}
+
+	var portfolio Portfolio
+	if result := DB.Where("user_id = ?", userID).First(&portfolio); result.Error != nil {
+		http.Error(w, "Portfolio not found for user", http.StatusNotFound)
+		return	}
+
+	if result := DB.Where("id = ? AND portfolio_id = ?", achievementID, portfolio.ID).Delete(&Achievement{}); result.Error != nil {
+		http.Error(w, "Failed to delete achievement or not authorized", http.StatusInternalServerError)
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// UpdateUser handles updating the authenticated user's username and email.
+func UpdateUser(w http.ResponseWriter, r *http.Request) {
+	userID, err := getUserIDFromContext(r)
+	if err != nil {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	var updatedUser User
+	err = json.NewDecoder(r.Body).Decode(&updatedUser)
+	if err != nil {
+		http.Error(w, "Invalid request payload", http.StatusBadRequest)
+		return
+	}
 
 	var user User
-	if result := DB.Where("username = ?", username).First(&user); result.Error != nil {
-		w.WriteHeader(http.StatusNotFound)
+	if result := DB.First(&user, userID); result.Error != nil {
+		http.Error(w, "User not found", http.StatusNotFound)
 		return
 	}
 
-	var projects []Project
-	if result := DB.Where("user_id = ?", user.ID).Find(&projects); result.Error != nil {
-		w.WriteHeader(http.StatusInternalServerError)
+	// Update fields
+	user.Username = updatedUser.Username
+	user.Email = updatedUser.Email
+
+	if result := DB.Save(&user); result.Error != nil {
+		http.Error(w, "Failed to update user", http.StatusInternalServerError)
 		return
 	}
 
-	json.NewEncoder(w).Encode(projects)
+	json.NewEncoder(w).Encode(map[string]string{"message": "User updated successfully"})
+}
+
+// ChangePassword handles changing the authenticated user's password.
+func ChangePassword(w http.ResponseWriter, r *http.Request) {
+	userID, err := getUserIDFromContext(r)
+	if err != nil {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	var req struct {
+		OldPassword string `json:"old_password"`
+		NewPassword string `json:"new_password"`
+	}
+	err = json.NewDecoder(r.Body).Decode(&req)
+	if err != nil {
+		http.Error(w, "Invalid request payload", http.StatusBadRequest)
+		return
+	}
+
+	var user User
+	if result := DB.First(&user, userID); result.Error != nil {
+		http.Error(w, "User not found", http.StatusNotFound)
+		return
+	}
+
+	if !CheckPasswordHash(req.OldPassword, user.Password) {
+		http.Error(w, "Old password does not match", http.StatusUnauthorized)
+		return
+	}
+
+	hashedPassword, err := HashPassword(req.NewPassword)
+	if err != nil {
+		http.Error(w, "Failed to hash new password", http.StatusInternalServerError)
+		return
+	}
+	user.Password = hashedPassword
+
+	if result := DB.Save(&user); result.Error != nil {
+		http.Error(w, "Failed to change password", http.StatusInternalServerError)
+		return
+	}
+
+	json.NewEncoder(w).Encode(map[string]string{"message": "Password changed successfully"})
+}
+
+// UploadImage handles image uploads.
+func UploadImage(w http.ResponseWriter, r *http.Request) {
+	// Maximum upload of 10 MB files
+	r.ParseMultipartForm(10 << 20)
+
+	file, handler, err := r.FormFile("image")
+	if err != nil {
+		http.Error(w, "Error retrieving the file", http.StatusBadRequest)
+		return
+	}
+	defer file.Close()
+
+	// Create a unique filename
+	fileName := uuid.New().String() + filepath.Ext(handler.Filename)
+	filePath := "./public/uploads/" + fileName // Assuming a public/uploads directory
+
+	// Create the uploads directory if it doesn't exist
+	if _, err := os.Stat("./public/uploads"); os.IsNotExist(err) {
+		os.MkdirAll("./public/uploads", 0755)
+	}
+
+	dst, err := os.Create(filePath)
+	if err != nil {
+		http.Error(w, "Error creating the file on server", http.StatusInternalServerError)
+		return
+	}
+	defer dst.Close()
+
+	if _, err := io.Copy(dst, file); err != nil {
+		http.Error(w, "Error saving the file", http.StatusInternalServerError)
+		return
+	}
+
+	// Return the URL of the uploaded image
+	imageURL := "/uploads/" + fileName // This URL will be relative to the server's root
+	json.NewEncoder(w).Encode(map[string]string{"image_url": imageURL})
 }

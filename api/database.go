@@ -22,6 +22,6 @@ func ConnectDB() {
 	log.Println("Database connection successfully opened")
 
 	// Migrate the schema
-	DB.AutoMigrate(&User{}, &Project{})
+	DB.AutoMigrate(&User{}, &Portfolio{}, &Project{}, &Achievement{})
 	log.Println("Database migrated")
 }
