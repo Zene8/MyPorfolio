@@ -27,11 +27,21 @@ func main() {
 	api := r.PathPrefix("/api").Subrouter()
 	api.HandleFunc("/register", RegisterUser).Methods("POST")
 	api.HandleFunc("/login", LoginUser).Methods("POST")
-	api.HandleFunc("/portfolio/{username}", GetPortfolio).Methods("GET") // Public portfolio view
+	api.Handle("/portfolio/{username}", OptionalAuthMiddleware(http.HandlerFunc(GetPortfolio))).Methods("GET") // Public portfolio view
+	api.HandleFunc("/contact", ContactForm).Methods("POST")
+
+	// Blog post public routes
+	api.HandleFunc("/posts", GetPosts).Methods("GET")
+	api.HandleFunc("/posts/{id}", GetPost).Methods("GET")
 
 	// Authenticated routes
 	auth := r.PathPrefix("/api/auth").Subrouter()
 	auth.Use(AuthMiddleware)
+
+	// Blog post authenticated routes
+	auth.HandleFunc("/posts", CreatePost).Methods("POST")
+	auth.HandleFunc("/posts/{id}", UpdatePost).Methods("PUT")
+	auth.HandleFunc("/posts/{id}", DeletePost).Methods("DELETE")
 
 	// Portfolio routes
 	auth.HandleFunc("/portfolio", UpdatePortfolio).Methods("PUT") // Update authenticated user's portfolio
@@ -41,6 +51,10 @@ func main() {
 	auth.HandleFunc("/portfolio/projects", GetProjects).Methods("GET")
 	auth.HandleFunc("/portfolio/projects/{id}", UpdateProject).Methods("PUT")
 	auth.HandleFunc("/portfolio/projects/{id}", DeleteProject).Methods("DELETE")
+
+	// Like routes
+	auth.HandleFunc("/portfolio/projects/{id}/like", LikeProject).Methods("POST")
+	auth.HandleFunc("/portfolio/projects/{id}/like", UnlikeProject).Methods("DELETE")
 
 	// Achievement routes (for authenticated user's portfolio)
 	auth.HandleFunc("/portfolio/achievements", CreateAchievement).Methods("POST")

@@ -28,3 +28,24 @@ func AuthMiddleware(next http.Handler) http.Handler {
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }
+
+// OptionalAuthMiddleware is a middleware that checks for a token but doesn't require it.
+func OptionalAuthMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		authHeader := r.Header.Get("Authorization")
+		if authHeader != "" {
+			tokenString := strings.Split(authHeader, " ")
+			if len(tokenString) == 2 {
+				claims, err := ValidateJWT(tokenString[1])
+				if err == nil {
+					// Pass user information to the next handler
+					ctx := context.WithValue(r.Context(), "userID", claims.UserID)
+					ctx = context.WithValue(ctx, "username", claims.Username)
+					next.ServeHTTP(w, r.WithContext(ctx))
+					return
+				}
+			}
+		}
+		next.ServeHTTP(w, r)
+	})
+}

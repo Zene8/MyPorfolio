@@ -10,6 +10,9 @@ export default function ProfileSettings() {
 
   const [username, setUsername] = useState(user?.username || '');
   const [email, setEmail] = useState(user?.email || '');
+  const [bio, setBio] = useState('');
+  const [socialMediaLinks, setSocialMediaLinks] = useState('');
+  const [profilePictureUrl, setProfilePictureUrl] = useState('');
   const [currentPassword, setCurrentPassword] = useState('');
   const [newPassword, setNewPassword] = useState('');
   const [confirmNewPassword, setConfirmNewPassword] = useState('');
@@ -19,10 +22,32 @@ export default function ProfileSettings() {
   useEffect(() => {
     if (!token) {
       router.push('/auth/login');
+      return;
     }
     if (user) {
       setUsername(user.username);
       setEmail(user.email);
+
+      const fetchUserData = async () => {
+        try {
+          const response = await fetch(`/api/portfolio/${user.username}`, {
+            headers: {
+              Authorization: `Bearer ${token}`,
+            },
+          });
+          if (!response.ok) {
+            throw new Error('Failed to fetch user data');
+          }
+          const data = await response.json();
+          setBio(data.user.bio || '');
+          setSocialMediaLinks(data.user.social_media_links || '');
+          setProfilePictureUrl(data.user.profile_picture_url || '');
+        } catch (err: any) {
+          setError(err.message);
+        }
+      };
+
+      fetchUserData();
     }
   }, [token, user, router]);
 
@@ -38,7 +63,7 @@ export default function ProfileSettings() {
           'Content-Type': 'application/json',
           Authorization: `Bearer ${token}`,
         },
-        body: JSON.stringify({ username, email }),
+        body: JSON.stringify({ username, email, bio, social_media_links: socialMediaLinks, profile_picture_url: profilePictureUrl }),
       });
 
       if (!response.ok) {
@@ -124,6 +149,36 @@ export default function ProfileSettings() {
               onChange={(e) => setEmail(e.target.value)}
               className="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 sm:text-sm"
               required
+            />
+          </div>
+          <div>
+            <label htmlFor="bio" className="block text-sm font-medium text-gray-700">Bio</label>
+            <textarea
+              id="bio"
+              value={bio}
+              onChange={(e) => setBio(e.target.value)}
+              className="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 sm:text-sm"
+              rows={4}
+            />
+          </div>
+          <div>
+            <label htmlFor="socialMediaLinks" className="block text-sm font-medium text-gray-700">Social Media Links (comma-separated)</label>
+            <input
+              type="text"
+              id="socialMediaLinks"
+              value={socialMediaLinks}
+              onChange={(e) => setSocialMediaLinks(e.target.value)}
+              className="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 sm:text-sm"
+            />
+          </div>
+          <div>
+            <label htmlFor="profilePictureUrl" className="block text-sm font-medium text-gray-700">Profile Picture URL</label>
+            <input
+              type="url"
+              id="profilePictureUrl"
+              value={profilePictureUrl}
+              onChange={(e) => setProfilePictureUrl(e.target.value)}
+              className="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 sm:text-sm"
             />
           </div>
           <button

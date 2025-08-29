@@ -94,9 +94,30 @@ func LoginUser(w http.ResponseWriter, r *http.Request) {
 }
 
 // GetPortfolio handles getting a user's public portfolio by username.
+
+type PublicPortfolio struct {
+	Portfolio
+	User PublicUser `json:"user"`
+	Projects []PublicProject `json:"projects"`
+}
+
+type PublicProject struct {
+	Project
+	LikesCount int64 `json:"likes_count"`
+	LikedByUser bool `json:"liked_by_user"`
+}
+
+type PublicUser struct {
+	Username string `json:"username"`
+	Bio string `json:"bio"`
+	SocialMediaLinks string `json:"social_media_links"`
+	ProfilePictureURL string `json:"profile_picture_url"`
+}
+
 func GetPortfolio(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	username := vars["username"]
+	currentUserID, _ := getUserIDFromContext(r)
 
 	var user User
 	if result := DB.Where("username = ?", username).First(&user); result.Error != nil {
@@ -105,12 +126,38 @@ func GetPortfolio(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var portfolio Portfolio
-	if result := DB.Preload("Projects").Preload("Achievements").Where("user_id = ?", user.ID).First(&portfolio); result.Error != nil {
+	if result := DB.Preload("Projects.Likes").Preload("Achievements").Where("user_id = ?", user.ID).First(&portfolio); result.Error != nil {
 		http.Error(w, "Portfolio not found", http.StatusNotFound)
 		return
 	}
 
-	json.NewEncoder(w).Encode(portfolio)
+	publicProjects := make([]PublicProject, len(portfolio.Projects))
+	for i, p := range portfolio.Projects {
+		publicProjects[i] = PublicProject{
+			Project: p,
+			LikesCount: int64(len(p.Likes)),
+			LikedByUser: false, // Default to false
+		}
+		for _, like := range p.Likes {
+			if like.UserID == currentUserID {
+				publicProjects[i].LikedByUser = true
+				break
+			}
+		}
+	}
+
+	publicPortfolio := PublicPortfolio{
+		Portfolio: portfolio,
+		User: PublicUser{
+			Username: user.Username,
+			Bio: user.Bio,
+			SocialMediaLinks: user.SocialMediaLinks,
+			ProfilePictureURL: user.ProfilePictureURL,
+		},
+		Projects: publicProjects,
+	}
+
+	json.NewEncoder(w).Encode(publicPortfolio)
 }
 
 // UpdatePortfolio handles updating the authenticated user's portfolio.
@@ -139,6 +186,7 @@ func UpdatePortfolio(w http.ResponseWriter, r *http.Request) {
 	portfolio.Description = updatedPortfolio.Description
 	portfolio.AboutMe = updatedPortfolio.AboutMe
 	portfolio.ContactInfo = updatedPortfolio.ContactInfo
+	portfolio.Layout = updatedPortfolio.Layout
 
 	if result := DB.Save(&portfolio); result.Error != nil {
 		http.Error(w, "Failed to update portfolio", http.StatusInternalServerError)
@@ -241,6 +289,7 @@ func UpdateProject(w http.ResponseWriter, r *http.Request) {
 	project.Technologies = updatedProject.Technologies
 	project.Link = updatedProject.Link
 	project.ImageURL = updatedProject.ImageURL
+	project.Featured = updatedProject.Featured
 
 	if result := DB.Save(&project); result.Error != nil {
 		http.Error(w, "Failed to update project", http.StatusInternalServerError)
@@ -434,6 +483,9 @@ func UpdateUser(w http.ResponseWriter, r *http.Request) {
 	// Update fields
 	user.Username = updatedUser.Username
 	user.Email = updatedUser.Email
+	user.Bio = updatedUser.Bio
+	user.SocialMediaLinks = updatedUser.SocialMediaLinks
+	user.ProfilePictureURL = updatedUser.ProfilePictureURL
 
 	if result := DB.Save(&user); result.Error != nil {
 		http.Error(w, "Failed to update user", http.StatusInternalServerError)
@@ -523,4 +575,208 @@ func UploadImage(w http.ResponseWriter, r *http.Request) {
 	// Return the URL of the uploaded image
 	imageURL := "/uploads/" + fileName // This URL will be relative to the server's root
 	json.NewEncoder(w).Encode(map[string]string{"image_url": imageURL})
+}
+
+// LikeProject handles liking a project.
+func LikeProject(w http.ResponseWriter, r *http.Request) {
+	userID, err := getUserIDFromContext(r)
+	if err != nil {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	vars := mux.Vars(r)
+	projectIDStr := vars["id"]
+	projectID, err := strconv.ParseUint(projectIDStr, 10, 64)
+	if err != nil {
+		http.Error(w, "Invalid project ID", http.StatusBadRequest)
+		return
+	}
+
+	like := Like{
+		UserID:    userID,
+		ProjectID: uint(projectID),
+	}
+
+	if result := DB.Create(&like); result.Error != nil {
+		http.Error(w, "Failed to like project", http.StatusInternalServerError)
+		return
+	}
+
+	w.WriteHeader(http.StatusCreated)
+	json.NewEncoder(w).Encode(map[string]string{"message": "Project liked successfully"})
+}
+
+// UnlikeProject handles unliking a project.
+func UnlikeProject(w http.ResponseWriter, r *http.Request) {
+	userID, err := getUserIDFromContext(r)
+	if err != nil {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	vars := mux.Vars(r)
+	projectIDStr := vars["id"]
+	projectID, err := strconv.ParseUint(projectIDStr, 10, 64)
+	if err != nil {
+		http.Error(w, "Invalid project ID", http.StatusBadRequest)
+		return
+	}
+
+	if result := DB.Where("user_id = ? AND project_id = ?", userID, projectID).Delete(&Like{}); result.Error != nil {
+		http.Error(w, "Failed to unlike project", http.StatusInternalServerError)
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// ContactForm handles submissions from the contact form.
+func ContactForm(w http.ResponseWriter, r *http.Request) {
+	var contactData struct {
+		Name    string `json:"name"`
+		Email   string `json:"email"`
+		Subject string `json:"subject"`
+		Message string `json:"message"`
+	}
+
+	err := json.NewDecoder(r.Body).Decode(&contactData)
+	if err != nil {
+		http.Error(w, "Invalid request payload", http.StatusBadRequest)
+		return
+	}
+
+	// For now, just log the data. In a real application, you would send an email.
+	log.Printf("Contact Form Submission:\nName: %s\nEmail: %s\nSubject: %s\nMessage: %s\n",
+		contactData.Name, contactData.Email, contactData.Subject, contactData.Message)
+
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]string{"message": "Message sent successfully!"})
+}
+
+// CreatePost handles creating a new blog post.
+func CreatePost(w http.ResponseWriter, r *http.Request) {
+	userID, err := getUserIDFromContext(r)
+	if err != nil {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	var post Post
+	err = json.NewDecoder(r.Body).Decode(&post)
+	if err != nil {
+		http.Error(w, "Invalid request payload", http.StatusBadRequest)
+		return
+	}
+
+	post.UserID = userID
+	post.PublishedAt = time.Now()
+
+	if result := DB.Create(&post); result.Error != nil {
+		http.Error(w, "Failed to create post", http.StatusInternalServerError)
+		return
+	}
+
+	w.WriteHeader(http.StatusCreated)
+	json.NewEncoder(w).Encode(post)
+}
+
+// GetPosts handles getting all blog posts.
+func GetPosts(w http.ResponseWriter, r *http.Request) {
+	var posts []Post
+	if result := DB.Find(&posts); result.Error != nil {
+		http.Error(w, "Failed to retrieve posts", http.StatusInternalServerError)
+		return
+	}
+
+	json.NewEncoder(w).Encode(posts)
+}
+
+// GetPost handles getting a single blog post by ID.
+func GetPost(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	postIDStr := vars["id"]
+	postID, err := strconv.ParseUint(postIDStr, 10, 64)
+	if err != nil {
+		http.Error(w, "Invalid post ID", http.StatusBadRequest)
+		return
+	}
+
+	var post Post
+	if result := DB.First(&post, postID); result.Error != nil {
+		http.Error(w, "Post not found", http.StatusNotFound)
+		return
+	}
+
+	json.NewEncoder(w).Encode(post)
+}
+
+// UpdatePost handles updating a blog post.
+func UpdatePost(w http.ResponseWriter, r *http.Request) {
+	userID, err := getUserIDFromContext(r)
+	if err != nil {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	vars := mux.Vars(r)
+	postIDStr := vars["id"]
+	postID, err := strconv.ParseUint(postIDStr, 10, 64)
+	if err != nil {
+		http.Error(w, "Invalid post ID", http.StatusBadRequest)
+		return
+	}
+
+	var post Post
+	if result := DB.Where("user_id = ?", userID).First(&post, postID); result.Error != nil {
+		http.Error(w, "Post not found or not authorized", http.StatusNotFound)
+		return
+	}
+
+	var updatedPost Post
+	err = json.NewDecoder(r.Body).Decode(&updatedPost)
+	if err != nil {
+		http.Error(w, "Invalid request payload", http.StatusBadRequest)
+		return
+	}
+
+	post.Title = updatedPost.Title
+	post.Content = updatedPost.Content
+
+	if result := DB.Save(&post); result.Error != nil {
+		http.Error(w, "Failed to update post", http.StatusInternalServerError)
+		return
+	}
+
+	json.NewEncoder(w).Encode(post)
+}
+
+// DeletePost handles deleting a blog post.
+func DeletePost(w http.ResponseWriter, r *http.Request) {
+	userID, err := getUserIDFromContext(r)
+	if err != nil {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	vars := mux.Vars(r)
+	postIDStr := vars["id"]
+	postID, err := strconv.ParseUint(postIDStr, 10, 64)
+	if err != nil {
+		http.Error(w, "Invalid post ID", http.StatusBadRequest)
+		return
+	}
+
+	var post Post
+	if result := DB.Where("user_id = ?", userID).First(&post, postID); result.Error != nil {
+		http.Error(w, "Post not found or not authorized", http.StatusNotFound)
+		return
+	}
+
+	if result := DB.Delete(&post); result.Error != nil {
+		http.Error(w, "Failed to delete post", http.StatusInternalServerError)
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
 }
